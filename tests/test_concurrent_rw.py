@@ -31,7 +31,7 @@ def test_concurrent_reads_during_writes(table_dir):
                     f"w-{i}", [{"id": 1000 + i * BATCH_SIZE + j} for j in range(BATCH_SIZE)]
                 )
                 log.info("写入提交: version=%d batch=w-%d", v, i)
-            except Exception as e:  # pragma: no cover
+            except Exception as e:  # noqa: BLE001  pragma: no cover
                 errors.append(e)
 
     def reader() -> None:
@@ -45,7 +45,7 @@ def test_concurrent_reads_during_writes(table_dir):
                 ids = [r["id"] for r in rows]
                 assert ids == sorted(ids), "快照内出现乱序/半批次数据"
                 snapshots_seen.append((v, len(rows)))
-            except Exception as e:  # pragma: no cover
+            except Exception as e:  # noqa: BLE001  pragma: no cover
                 errors.append(e)
 
     w = threading.Thread(target=writer)
@@ -82,7 +82,7 @@ def test_concurrent_writers_unique_versions(table_dir):
                 v = t.commit_batch(f"t{tid}-b{i}", [{"id": tid * 100 + i}])
                 with lock:
                     versions.append(v)
-            except Exception as e:  # pragma: no cover
+            except Exception as e:  # noqa: BLE001  pragma: no cover
                 errors.append(e)
 
     threads = [threading.Thread(target=writer, args=(k,)) for k in range(5)]

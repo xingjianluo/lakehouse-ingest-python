@@ -10,13 +10,34 @@ class LakehouseError(Exception):
 
 
 class DuplicateBatchError(LakehouseError):
-    """批次重复提交：该批次此前已成功提交，本次提交被忽略（幂等）。"""
+    """批次幂等重试：该批次此前已成功提交，且本次内容与首次完全一致。
+
+    本次提交不写入任何数据；调用方把它当作成功重试处理即可，
+    首次提交的版本号与记录数可直接从该异常对象取回。
+    """
+
+    def __init__(self, batch_id: str, committed_version: int, record_count: int) -> None:
+        self.batch_id = batch_id
+        self.committed_version = committed_version
+        self.record_count = record_count
+        super().__init__(
+            f"批次 {batch_id!r} 与版本 {committed_version} 的首次提交内容一致，"
+            f"按幂等重试处理，未重复写入"
+        )
+
+
+class BatchConflictError(LakehouseError):
+    """同批次号内容冲突：该 batch_id 已成功提交过，但本次内容与首次不一致。
+
+    属于必须由程序显式处理的对账失败：本次提交被拒绝，不写入任何数据。
+    """
 
     def __init__(self, batch_id: str, committed_version: int) -> None:
         self.batch_id = batch_id
         self.committed_version = committed_version
         super().__init__(
-            f"批次 {batch_id!r} 已在版本 {committed_version} 提交，重复提交被幂等忽略"
+            f"批次 {batch_id!r} 此前已在版本 {committed_version} 提交，"
+            f"但本次内容与首次不一致（批次号被复用且内容已变），提交被拒绝"
         )
 
 
@@ -24,8 +45,10 @@ class SchemaRejectionReason(str, Enum):
     """结构变更被拒绝的具体原因。"""
 
     FIELD_REMOVED = "field_removed"
+    TYPE_CHANGED = "type_changed"
     TYPE_NARROWED = "type_narrowed"
     TYPE_INCOMPATIBLE = "type_incompatible"
+    DEFAULT_TYPE_MISMATCH = "default_type_mismatch"
     MISSING_DEFAULT_FOR_REQUIRED = "missing_default_for_required"
 
 

@@ -66,14 +66,32 @@ def test_remove_field_rejected(table_dir):
     assert t.snapshot() == [{"id": 1, "name": "a"}]
 
 
+def test_existing_field_type_change_rejected_even_when_widening(table_dir):
+    """新规则：既有字段任何类型变更都拒绝，包括 int->float 这类加宽。
+
+    原因：声明类型一变，历史行原值的语义就与新声明对不上。
+    """
+    t = Table(table_dir, Schema((Field("v", "int"),)))
+    t.commit_batch("b1", [{"v": 1}])
+    bad = Schema((Field("v", "float"),))
+    with pytest.raises(IncompatibleSchemaError) as exc:
+        t.commit_batch("b2", [{"v": 2.5}], bad)
+    assert exc.value.reason == SchemaRejectionReason.TYPE_CHANGED
+    assert exc.value.field == "v"
+    log.info("拒绝: batch=b2 原因=%s 字段=v 判定依据=既有字段类型一律不得变更(int->float)",
+             exc.value.reason.value)
+    assert t.current_version() == 1
+    assert t.snapshot() == [{"v": 1}]
+
+
 def test_type_narrowing_rejected(table_dir):
     t = Table(table_dir, Schema((Field("v", "float"),)))
     t.commit_batch("b1", [{"v": 1.5}])
     bad = Schema((Field("v", "int"),))
     with pytest.raises(IncompatibleSchemaError) as exc:
         t.commit_batch("b2", [{"v": 2}], bad)
-    assert exc.value.reason == SchemaRejectionReason.TYPE_NARROWED
-    log.info("拒绝: batch=b2 原因=%s 字段=v 判定依据=float->int 属于类型收窄",
+    assert exc.value.reason == SchemaRejectionReason.TYPE_CHANGED
+    log.info("拒绝: batch=b2 原因=%s 字段=v 判定依据=float->int 属于既有字段类型变更",
              exc.value.reason.value)
     assert t.current_version() == 1
 
@@ -84,19 +102,36 @@ def test_incompatible_type_change_rejected(table_dir):
     bad = Schema((Field("id", "int"), Field("name", "bool")))
     with pytest.raises(IncompatibleSchemaError) as exc:
         t.commit_batch("b2", [{"id": 2, "name": True}], bad)
-    assert exc.value.reason == SchemaRejectionReason.TYPE_INCOMPATIBLE
-    log.info("拒绝: batch=b2 原因=%s 字段=name 判定依据=string->bool 跨类型族",
+    assert exc.value.reason == SchemaRejectionReason.TYPE_CHANGED
+    log.info("拒绝: batch=b2 原因=%s 字段=name 判定依据=string->bool 既有字段类型变更",
              exc.value.reason.value)
     assert t.current_version() == 1
 
 
-def test_type_widening_allowed(table_dir):
-    t = Table(table_dir, Schema((Field("v", "int"),)))
-    t.commit_batch("b1", [{"v": 1}])
-    widened = Schema((Field("v", "float"),))
-    v2 = t.commit_batch("b2", [{"v": 2.5}], widened)
-    assert t.snapshot() == [{"v": 1}, {"v": 2.5}]
-    log.info("加宽放行: version=%d batch=b2 判定依据=int->float 为兼容加宽", v2)
+def test_new_field_default_must_match_type(table_dir):
+    t = Table(table_dir, BASE)
+    t.commit_batch("b1", [{"id": 1, "name": "a"}])
+    bad = Schema((*BASE.fields, Field("score", "int", "not-an-int")))
+    with pytest.raises(IncompatibleSchemaError) as exc:
+        t.commit_batch("b2", [{"id": 2, "name": "b"}], bad)
+    assert exc.value.reason == SchemaRejectionReason.DEFAULT_TYPE_MISMATCH
+    assert exc.value.field == "score"
+    log.info("拒绝: batch=b2 原因=%s 字段=score 判定依据=缺省值与声明类型不匹配",
+             exc.value.reason.value)
+    assert t.current_version() == 1
+    assert t.snapshot() == [{"id": 1, "name": "a"}]
+
+
+def test_new_nullable_field_allowed(table_dir):
+    t = Table(table_dir, BASE)
+    t.commit_batch("b1", [{"id": 1, "name": "a"}])
+    evolved = Schema((*BASE.fields, Field("note", "string", None)))
+    v2 = t.commit_batch("b2", [{"id": 2, "name": "b"}], evolved)
+    log.info("放行: version=%d batch=b2 判定依据=新增可空字段 default=None", v2)
+    assert t.snapshot() == [
+        {"id": 1, "name": "a", "note": None},
+        {"id": 2, "name": "b", "note": None},
+    ]
 
 
 def test_record_value_type_mismatch_rejected(table_dir):

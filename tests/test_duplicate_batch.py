@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from lakehouse import DuplicateBatchError, Schema, Field, Table
+from lakehouse import DuplicateBatchError, Field, Schema, Table
 
 log = logging.getLogger("lakehouse-test")
 
