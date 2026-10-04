@@ -28,7 +28,8 @@ def test_concurrent_reads_during_writes(table_dir):
         for i in range(N_BATCHES):
             try:
                 v = t.commit_batch(
-                    f"w-{i}", [{"id": 1000 + i * BATCH_SIZE + j} for j in range(BATCH_SIZE)]
+                    f"w-{i}",
+                    [{"id": 1000 + i * BATCH_SIZE + j} for j in range(BATCH_SIZE)],
                 )
                 log.info("写入提交: version=%d batch=w-%d", v, i)
             except Exception as e:  # pragma: no cover
@@ -41,7 +42,9 @@ def test_concurrent_reads_during_writes(table_dir):
                 rows = t.snapshot(v)
                 # 一致性判定：读到的行数必须等于该版本提交时的记录数，
                 # 且所有 id 严格递增无空洞（不得读到半个批次）。
-                assert len(rows) == 5 + (v - 5) * BATCH_SIZE or v <= 5 and len(rows) == v
+                assert (
+                    len(rows) == 5 + (v - 5) * BATCH_SIZE or v <= 5 and len(rows) == v
+                )
                 ids = [r["id"] for r in rows]
                 assert ids == sorted(ids), "快照内出现乱序/半批次数据"
                 snapshots_seen.append((v, len(rows)))
@@ -60,14 +63,19 @@ def test_concurrent_reads_during_writes(table_dir):
 
     assert not errors, f"并发期间出现错误: {errors[:3]}"
     assert snapshots_seen, "读者未获得任何快照"
-    log.info("并发期间读到 %d 个一致快照, 示例: %s", len(snapshots_seen), snapshots_seen[:3])
+    log.info(
+        "并发期间读到 %d 个一致快照, 示例: %s", len(snapshots_seen), snapshots_seen[:3]
+    )
 
     # 写完后最终版本数据完整：无重复、无丢失。
     final = t.snapshot()
     assert len(final) == 5 + N_BATCHES * BATCH_SIZE
     assert len({r["id"] for r in final}) == len(final)
-    log.info("最终校验: version=%d 行数=%d 判定依据=全量去重后行数一致",
-             t.current_version(), len(final))
+    log.info(
+        "最终校验: version=%d 行数=%d 判定依据=全量去重后行数一致",
+        t.current_version(),
+        len(final),
+    )
 
 
 def test_concurrent_writers_unique_versions(table_dir):
@@ -96,8 +104,41 @@ def test_concurrent_writers_unique_versions(table_dir):
     assert sorted(versions) == list(range(1, 51))
     assert len(t.storage.read_log()) == 50
     assert len(t.snapshot()) == 50
-    log.info("并发写入: 提交版本数=%d 判定依据=版本号连续无冲突 1..%d",
-             len(versions), t.current_version())
+    log.info(
+        "并发写入: 提交版本数=%d 判定依据=版本号连续无冲突 1..%d",
+        len(versions),
+        t.current_version(),
+    )
+
+
+def test_concurrent_identical_retry_single_commit(table_dir):
+    """多个任务同时重试同一批次（内容一致）：只有一个真写，其余拿到一致结果。"""
+    t = Table(table_dir, SCHEMA)
+    records = [{"id": 7}]
+    versions: list[int] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def retryer() -> None:
+        for _ in range(5):
+            try:
+                v = t.commit_batch("hot-batch", records)
+                with lock:
+                    versions.append(v)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+    threads = [threading.Thread(target=retryer) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert not errors
+    assert set(versions) == {1}, "8 任务 × 5 次重试必须全部拿到首次提交的版本号"
+    assert len(t.storage.read_log()) == 1
+    assert t.snapshot() == records
+    log.info("并发同号重试: 任务数=8 重试次数=40 全部返回 version=1 日志条目=1")
 
 
 def test_snapshot_reproducible_after_more_writes(table_dir):

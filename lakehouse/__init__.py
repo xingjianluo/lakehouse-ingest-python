@@ -1,5 +1,5 @@
 from .errors import (
-    DuplicateBatchError,
+    BatchConflictError,
     IncompatibleSchemaError,
     LakehouseError,
     RecordValidationError,
@@ -7,19 +7,28 @@ from .errors import (
     VersionExpiredError,
     VersionNotFoundError,
 )
-from .schema import Field, Schema, check_compatibility
-from .table import Table
+from .schema import (
+    Field,
+    Schema,
+    SchemaCheckResult,
+    check_compatibility,
+    precheck_compatibility,
+)
+from .table import BatchStatus, Table
 
 __all__ = [
-    "DuplicateBatchError",
+    "BatchConflictError",
+    "BatchStatus",
     "Field",
     "IncompatibleSchemaError",
     "LakehouseError",
     "RecordValidationError",
     "Schema",
+    "SchemaCheckResult",
     "SchemaRejectionReason",
     "Table",
     "VersionExpiredError",
     "VersionNotFoundError",
     "check_compatibility",
+    "precheck_compatibility",
 ]

@@ -1,57 +1,131 @@
-"""重复批次：重复提交或重试后数据不得重复或丢失，提交整体生效或整体不生效。"""
+"""批次重试与对账：同号同内容按重试返回首次结果；同号不同内容明确冲突失败。"""
 
 import logging
 
 import pytest
 
-from lakehouse import DuplicateBatchError, Schema, Field, Table
+from lakehouse import BatchConflictError, Field, RecordValidationError, Schema, Table
 
 log = logging.getLogger("lakehouse-test")
 
 SCHEMA = Schema((Field("id", "int"), Field("name", "string")))
+RECORDS = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
 
 
-def test_duplicate_batch_is_idempotent(table_dir):
+def test_identical_retry_returns_first_result(table_dir):
+    """同批次号 + 内容一致 -> 幂等重试：返回首次版本号，不再写任何数据。"""
     t = Table(table_dir, SCHEMA)
-    v1 = t.commit_batch("batch-001", [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}])
-    log.info("提交成功: version=%d batch=%s 判定依据=首次提交", v1, "batch-001")
+    v1 = t.commit_batch("batch-001", RECORDS)
+    log.info("首次提交: version=%d batch=batch-001 判定依据=新批次", v1)
 
-    with pytest.raises(DuplicateBatchError) as exc:
-        t.commit_batch("batch-001", [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}])
+    v2 = t.commit_batch("batch-001", RECORDS)
     log.info(
-        "重复提交被拒绝: batch=%s 已提交版本=%d 判定依据=批次标识已存在于提交日志",
-        exc.value.batch_id, exc.value.committed_version,
+        "一致重试: batch=batch-001 返回 version=%d 判定依据=内容指纹与首次一致", v2
+    )
+    assert v2 == v1
+
+    # 数据与元数据均未变化：无重复、无丢失、不占新版本。
+    assert t.current_version() == v1
+    assert t.snapshot() == RECORDS
+    assert len(t.storage.read_log()) == 1
+    log.info(
+        "校验通过: version=%d 行数=%d 日志条目=1",
+        t.current_version(),
+        len(t.snapshot()),
     )
 
-    # 数据与元数据均未变化：无重复、无丢失。
+
+def test_conflicting_content_rejected_with_version(table_dir):
+    """同批次号 + 内容变了 -> BatchConflictError，可定位批次与已落版本。"""
+    t = Table(table_dir, SCHEMA)
+    v1 = t.commit_batch("batch-002", [{"id": 1, "name": "x"}])
+
+    with pytest.raises(BatchConflictError) as exc:
+        t.commit_batch("batch-002", [{"id": 1, "name": "CHANGED"}])
+    assert exc.value.batch_id == "batch-002"
+    assert exc.value.committed_version == v1
+    log.info(
+        "冲突拒绝: batch=%s 已提交版本=%d 判定依据=内容指纹与首次不一致",
+        exc.value.batch_id,
+        exc.value.committed_version,
+    )
+
+    # 冲突不产生任何写入：版本与数据保持首次提交的样子。
     assert t.current_version() == v1
-    assert t.snapshot() == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+    assert t.snapshot() == [{"id": 1, "name": "x"}]
     assert len(t.storage.read_log()) == 1
-    log.info("校验通过: version=%d 行数=%d 日志条目=%d", t.current_version(), len(t.snapshot()), 1)
 
 
-def test_retry_after_success_keeps_data(table_dir):
+def test_retry_after_crash_mid_commit_no_duplication(table_dir):
+    """写入方在"数据已落盘、日志未追加"处崩溃：重试整体重写，不多不少。"""
     t = Table(table_dir, SCHEMA)
-    t.commit_batch("batch-002", [{"id": 1, "name": "x"}])
-    t.commit_batch("batch-003", [{"id": 2, "name": "y"}])
+    # 模拟崩溃残留：v1 数据文件已写（孤儿），日志里没有提交记录。
+    t.storage.write_version_data(1, [{"id": 999, "name": "orphan"}])
+    assert t.current_version() == 0
 
-    # 模拟重试第一批：不得覆盖、不得重复。
-    with pytest.raises(DuplicateBatchError):
-        t.commit_batch("batch-002", [{"id": 1, "name": "x"}])
-    assert t.current_version() == 2
-    assert t.snapshot() == [{"id": 1, "name": "x"}, {"id": 2, "name": "y"}]
-    log.info("重试批次=batch-002 判定依据=幂等拒绝, 当前版本=%d 行数=%d",
-             t.current_version(), len(t.snapshot()))
+    v = t.commit_batch("batch-003", [{"id": 1, "name": "a"}])
+    assert v == 1  # 版本号从日志重算，不被孤儿文件占用
+    assert t.snapshot() == [{"id": 1, "name": "a"}]
+    assert len(t.storage.read_log()) == 1
+    log.info("崩溃重试: version=%d batch=batch-003 判定依据=孤儿数据文件被整体重写", v)
 
 
-def test_reopen_table_still_detects_duplicate(table_dir):
+def test_reopen_table_retry_is_idempotent(table_dir):
+    """进程重启后重试同一批次：仍按首次结果返回，不重复写入。"""
     t = Table(table_dir, SCHEMA)
-    t.commit_batch("batch-010", [{"id": 7, "name": "z"}])
+    v1 = t.commit_batch("batch-010", [{"id": 7, "name": "z"}])
 
-    # 重新打开表（模拟进程重启后重试），元数据日志仍记得该批次。
-    t2 = Table(table_dir, SCHEMA)
-    with pytest.raises(DuplicateBatchError) as exc:
-        t2.commit_batch("batch-010", [{"id": 7, "name": "z"}])
-    log.info("重启后重试被拒绝: batch=%s committed_version=%d 判定依据=日志持久化",
-             exc.value.batch_id, exc.value.committed_version)
+    t2 = Table(table_dir, SCHEMA)  # 重新打开表（模拟进程重启）
+    v2 = t2.commit_batch("batch-010", [{"id": 7, "name": "z"}])
+    assert v2 == v1
+    assert t2.current_version() == v1
     assert t2.snapshot() == [{"id": 7, "name": "z"}]
+    log.info("重启重试: batch=batch-010 返回 version=%d 判定依据=指纹随日志持久化", v2)
+
+
+def test_batch_status_committed_rejected_unknown(table_dir):
+    """按批次号对账：成功可查版本与行数，被拒绝可查原因，未知批次可区分。"""
+    t = Table(table_dir, SCHEMA)
+    v1 = t.commit_batch("ok-batch", RECORDS)
+
+    committed = t.batch_status("ok-batch")
+    assert committed.status == "committed"
+    assert committed.version == v1
+    assert committed.record_count == len(RECORDS)
+    log.info(
+        "对账[成功]: batch=ok-batch version=%d 行数=%d",
+        committed.version,
+        committed.record_count,
+    )
+
+    # 制造一个被拒绝的批次（记录类型不匹配）。
+    with pytest.raises(RecordValidationError):
+        t.commit_batch("bad-batch", [{"id": "not-an-int", "name": "a"}])
+    rejected = t.batch_status("bad-batch")
+    assert rejected.status == "rejected"
+    assert rejected.reason == "record_validation"
+    assert rejected.detail
+    log.info(
+        "对账[拒绝]: batch=bad-batch 原因=%s 判定依据=%s",
+        rejected.reason,
+        rejected.detail,
+    )
+
+    unknown = t.batch_status("never-seen")
+    assert unknown.status == "unknown"
+    log.info("对账[未知]: batch=never-seen status=unknown")
+
+
+def test_rejected_batch_retry_is_judged_fresh(table_dir):
+    """被拒绝的批次不占版本、不留数据；同号重试按全新提交重新判定。"""
+    t = Table(table_dir, SCHEMA)
+    with pytest.raises(RecordValidationError):
+        t.commit_batch("retry-me", [{"id": "bad", "name": "a"}])
+    assert t.current_version() == 0
+    assert not t.storage.version_path(1).exists()
+
+    # 同一批次号修正内容后重试：不受上次失败影响，正常提交。
+    v = t.commit_batch("retry-me", [{"id": 1, "name": "a"}])
+    assert v == 1
+    assert t.batch_status("retry-me").status == "committed"
+    log.info("拒绝后重试: batch=retry-me version=%d 判定依据=拒绝记录不参与提交判定", v)

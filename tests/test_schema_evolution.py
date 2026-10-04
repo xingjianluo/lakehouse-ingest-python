@@ -22,11 +22,13 @@ def test_add_field_with_default_applies_to_history(table_dir):
     t = Table(table_dir, BASE)
     v1 = t.commit_batch("b1", [{"id": 1, "name": "a"}])
 
-    evolved = Schema((
-        Field("id", "int"),
-        Field("name", "string"),
-        Field("score", "float", 0.0),
-    ))
+    evolved = Schema(
+        (
+            Field("id", "int"),
+            Field("name", "string"),
+            Field("score", "float", 0.0),
+        )
+    )
     v2 = t.commit_batch("b2", [{"id": 2, "name": "b", "score": 9.5}], evolved)
     log.info("结构演进提交: version=%d batch=b2 判定依据=新增字段 score 缺省值 0.0", v2)
 
@@ -59,8 +61,11 @@ def test_remove_field_rejected(table_dir):
         t.commit_batch("b2", [{"id": 2}], bad)
     assert exc.value.reason == SchemaRejectionReason.FIELD_REMOVED
     assert exc.value.field == "name"
-    log.info("拒绝: batch=b2 原因=%s 字段=%s 判定依据=不允许删除既有字段",
-             exc.value.reason.value, exc.value.field)
+    log.info(
+        "拒绝: batch=b2 原因=%s 字段=%s 判定依据=不允许删除既有字段",
+        exc.value.reason.value,
+        exc.value.field,
+    )
     # 失败不产生任何写入：版本与数据不变。
     assert t.current_version() == 1
     assert t.snapshot() == [{"id": 1, "name": "a"}]
@@ -73,8 +78,10 @@ def test_type_narrowing_rejected(table_dir):
     with pytest.raises(IncompatibleSchemaError) as exc:
         t.commit_batch("b2", [{"v": 2}], bad)
     assert exc.value.reason == SchemaRejectionReason.TYPE_NARROWED
-    log.info("拒绝: batch=b2 原因=%s 字段=v 判定依据=float->int 属于类型收窄",
-             exc.value.reason.value)
+    log.info(
+        "拒绝: batch=b2 原因=%s 字段=v 判定依据=float->int 属于类型收窄",
+        exc.value.reason.value,
+    )
     assert t.current_version() == 1
 
 
@@ -85,8 +92,10 @@ def test_incompatible_type_change_rejected(table_dir):
     with pytest.raises(IncompatibleSchemaError) as exc:
         t.commit_batch("b2", [{"id": 2, "name": True}], bad)
     assert exc.value.reason == SchemaRejectionReason.TYPE_INCOMPATIBLE
-    log.info("拒绝: batch=b2 原因=%s 字段=name 判定依据=string->bool 跨类型族",
-             exc.value.reason.value)
+    log.info(
+        "拒绝: batch=b2 原因=%s 字段=name 判定依据=string->bool 跨类型族",
+        exc.value.reason.value,
+    )
     assert t.current_version() == 1
 
 

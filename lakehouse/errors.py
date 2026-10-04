@@ -9,14 +9,18 @@ class LakehouseError(Exception):
     """所有湖仓摄取错误的基类。"""
 
 
-class DuplicateBatchError(LakehouseError):
-    """批次重复提交：该批次此前已成功提交，本次提交被忽略（幂等）。"""
+class BatchConflictError(LakehouseError):
+    """批次内容冲突：同一 batch_id 已提交，但本次内容与首次提交不一致。
+
+    携带已提交的版本号，便于对账定位冲突批次落在哪个版本。
+    """
 
     def __init__(self, batch_id: str, committed_version: int) -> None:
         self.batch_id = batch_id
         self.committed_version = committed_version
         super().__init__(
-            f"批次 {batch_id!r} 已在版本 {committed_version} 提交，重复提交被幂等忽略"
+            f"批次 {batch_id!r} 已在版本 {committed_version} 提交，"
+            "本次提交内容与其不一致，被拒绝"
         )
 
 
@@ -26,7 +30,8 @@ class SchemaRejectionReason(str, Enum):
     FIELD_REMOVED = "field_removed"
     TYPE_NARROWED = "type_narrowed"
     TYPE_INCOMPATIBLE = "type_incompatible"
-    MISSING_DEFAULT_FOR_REQUIRED = "missing_default_for_required"
+    DEFAULT_TYPE_MISMATCH = "default_type_mismatch"
+    UNKNOWN_TYPE = "unknown_type"
 
 
 class IncompatibleSchemaError(LakehouseError):
@@ -52,9 +57,7 @@ class VersionExpiredError(LakehouseError):
     def __init__(self, version: int, min_available: int) -> None:
         self.version = version
         self.min_available = min_available
-        super().__init__(
-            f"版本 {version} 已过期，当前最早可用版本为 {min_available}"
-        )
+        super().__init__(f"版本 {version} 已过期，当前最早可用版本为 {min_available}")
 
 
 class RecordValidationError(LakehouseError):

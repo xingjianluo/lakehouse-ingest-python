@@ -50,8 +50,11 @@ def test_expired_version_rejected_after_cleanup(table_dir):
         t.snapshot(2)
     assert exc.value.version == 2
     assert exc.value.min_available == 4
-    log.info("拒绝: version=%d 判定依据=已过期, 最早可用版本=%d",
-             exc.value.version, exc.value.min_available)
+    log.info(
+        "拒绝: version=%d 判定依据=已过期, 最早可用版本=%d",
+        exc.value.version,
+        exc.value.min_available,
+    )
 
     # 保留的版本仍可复现，且元数据日志完整保留。
     assert t.snapshot(4) == [{"id": i} for i in range(1, 5)]
