@@ -99,13 +99,23 @@ def test_incompatible_type_change_rejected(table_dir):
     assert t.current_version() == 1
 
 
-def test_type_widening_allowed(table_dir):
+def test_int_to_float_rejected_stored_data_mismatch(table_dir):
+    """int -> float 也拒绝：历史行读出来仍是 int，与声明的 float 对不上。"""
     t = Table(table_dir, Schema((Field("v", "int"),)))
     t.commit_batch("b1", [{"v": 1}])
     widened = Schema((Field("v", "float"),))
-    v2 = t.commit_batch("b2", [{"v": 2.5}], widened)
-    assert t.snapshot() == [{"v": 1}, {"v": 2.5}]
-    log.info("加宽放行: version=%d batch=b2 判定依据=int->float 为兼容加宽", v2)
+    with pytest.raises(IncompatibleSchemaError) as exc:
+        t.commit_batch("b2", [{"v": 2.5}], widened)
+    assert exc.value.reason == SchemaRejectionReason.TYPE_MISMATCH
+    assert exc.value.field == "v"
+    log.info(
+        "拒绝: batch=b2 原因=%s 字段=v 判定依据=历史 int 行与声明 float 对不上",
+        exc.value.reason.value,
+    )
+    # 拒绝不留数据、不占版本，历史行原样可读。
+    assert t.current_version() == 1
+    assert t.snapshot() == [{"v": 1}]
+    assert t.schema() == Schema((Field("v", "int"),))
 
 
 def test_record_value_type_mismatch_rejected(table_dir):

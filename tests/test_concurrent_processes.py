@@ -27,6 +27,17 @@ def _worker(root: str, batches: list[tuple[str, list[dict]]], queue) -> None:
     queue.put(results)
 
 
+def _worker_no_schema(root: str, batch_id: str, records, queue) -> None:
+    """子进程入口：打开表时不携带结构，提交重试也不携带结构。"""
+    from lakehouse import BatchConflictError
+
+    t = Table(Path(root))
+    try:
+        queue.put(("ok", batch_id, t.commit_batch(batch_id, records)))
+    except BatchConflictError as e:
+        queue.put(("conflict", batch_id, e.committed_version))
+
+
 def _run_processes(table_dir, jobs: list[list[tuple[str, list[dict]]]]) -> list:
     ctx = mp.get_context("fork")
     queue = ctx.Queue()
@@ -81,6 +92,41 @@ def test_multi_process_identical_retry_single_commit(table_dir):
     log.info(
         "多进程同号重试: 进程数=6 全部返回 version=%d 日志条目=1 判定依据=内容指纹一致",
         versions.pop(),
+    )
+
+
+def test_multi_process_retry_without_schema_dedupes(table_dir):
+    """跨进程：首次带结构提交，其他进程不携带结构重试同批内容 -> 幂等。"""
+    from lakehouse import Field as F
+
+    two_col = Schema((F("id", "int"), F("name", "string")))
+    t = Table(table_dir, two_col)
+    records = [{"id": 1, "name": "a"}]
+    v1 = t.commit_batch("cross-batch", records, two_col)
+    log.info("首次提交(带结构): batch=cross-batch version=%d", v1)
+
+    ctx = mp.get_context("fork")
+    queue = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_worker_no_schema,
+            args=(str(table_dir), "cross-batch", records, queue),
+        )
+        for _ in range(4)
+    ]
+    for p in procs:
+        p.start()
+    results = [queue.get(timeout=60) for _ in procs]
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+    assert all(outcome == "ok" and v == v1 for outcome, _, v in results)
+    assert len(t.storage.read_log()) == 1
+    assert Table(table_dir).snapshot() == records
+    log.info(
+        "多进程不带结构重试: %d 个进程全部返回 version=%d 日志条目=1 判定依据=记录内容一致",
+        len(results),
+        v1,
     )
 
 

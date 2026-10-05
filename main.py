@@ -89,9 +89,18 @@ def get_batch_status(batch_id: str):
         )
     body = {"batch_id": status.batch_id, "status": status.status}
     if status.status == "committed":
-        body.update(version=status.version, record_count=status.record_count)
+        body.update(
+            version=status.version,
+            record_count=status.record_count,
+            last_rejection_reason=status.last_rejection_reason,
+            last_rejection_detail=status.last_rejection_detail,
+        )
     else:
-        body.update(reason=status.reason, detail=status.detail)
+        body.update(
+            reason=status.reason,
+            detail=status.detail,
+            committed_version=status.committed_version,
+        )
     return body
 
 

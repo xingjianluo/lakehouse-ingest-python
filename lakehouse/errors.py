@@ -28,7 +28,8 @@ class SchemaRejectionReason(str, Enum):
     """结构变更被拒绝的具体原因。"""
 
     FIELD_REMOVED = "field_removed"
-    TYPE_NARROWED = "type_narrowed"
+    TYPE_NARROWED = "type_narrowned"
+    TYPE_MISMATCH = "type_mismatch"
     TYPE_INCOMPATIBLE = "type_incompatible"
     DEFAULT_TYPE_MISMATCH = "default_type_mismatch"
     UNKNOWN_TYPE = "unknown_type"

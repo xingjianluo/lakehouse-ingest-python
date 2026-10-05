@@ -10,6 +10,9 @@
 一致性手段：
 - 所有数据文件先写临时文件再 os.replace 原子改名，避免半截文件；
 - 提交日志只允许追加，读取时按行解析，容忍最后一行残缺（视为未提交）；
+- 持排他锁提交前先修复日志尾部：崩溃残留的残缺行会被截断清除，
+  之后所有提交都会被真正追加到有效日志末尾，杜绝"接口返回新版本但
+  重开表读不到、后续提交持续被吞"；
 - 提交临界区由 fcntl.flock 排他锁保护：同一台机器上的多个进程/终端
   对同一张表的提交被串行化，且持锁期间重新读取日志，保证版本号唯一、
   批次判定基于最新已提交状态。
@@ -40,6 +43,9 @@ class CommitEntry:
     # 批次内容指纹（记录+结构的规范哈希），用于识别"同批次号不同内容"。
     # 旧格式日志行没有该字段，反序列化时缺省为 None。
     fingerprint: str | None = None
+    # 本批次自己带来的记录数（区别于 record_count——那是该版本全量行数）。
+    # 旧格式日志行没有该字段时取 None，由上层兜底推算。
+    batch_record_count: int | None = None
 
     def to_json(self) -> str:
         d = asdict(self)
@@ -55,6 +61,7 @@ class CommitEntry:
             schema=schema,
             record_count=d["record_count"],
             fingerprint=d.get("fingerprint"),
+            batch_record_count=d.get("batch_record_count"),
         )
 
 
@@ -65,6 +72,8 @@ class RejectionEntry:
     batch_id: str
     reason: str
     detail: str
+    # 冲突拒绝时：该批次已经落地的版本号，便于对账定位。
+    committed_version: int | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -73,7 +82,10 @@ class RejectionEntry:
     def from_json(line: str) -> RejectionEntry:
         d = json.loads(line)
         return RejectionEntry(
-            batch_id=d["batch_id"], reason=d["reason"], detail=d["detail"]
+            batch_id=d["batch_id"],
+            reason=d["reason"],
+            detail=d["detail"],
+            committed_version=d.get("committed_version"),
         )
 
 
@@ -129,6 +141,42 @@ class LocalStorage:
             f.flush()
             os.fsync(f.fileno())
 
+    def recover_logs(self) -> None:
+        """修复崩溃残留：截断提交/拒绝日志末尾的残缺行，并清理孤儿临时文件。
+
+        必须在持有表级排他锁时调用：此时没有任何其他进程/线程能并发追加，
+        因此"最后一个换行符之后的任何内容"只可能来自崩溃进程写到一半的
+        残留，截断它不会误伤任何进行中的提交。修复后后续追加都落在有效
+        日志末尾，已提交版本不会被遮蔽。
+        """
+        self._truncate_trailing_garbage(self.log_path)
+        self._truncate_trailing_garbage(self.rejections_path)
+        # 清理崩溃进程留在数据目录里的临时文件（正常路径已自行清理）。
+        for p in self.data_dir.glob(".tmp-*"):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _truncate_trailing_garbage(path: Path) -> None:
+        """把文件截断到最后一个完整行（以 \\n 结尾）的末尾。"""
+        if not path.exists() or path.stat().st_size == 0:
+            return
+        with open(path, "rb+") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = min(size, 1 << 16)
+            f.seek(size - block)
+            tail = f.read()
+            idx = tail.rfind(b"\n")
+            if idx == -1:
+                f.seek(0)
+                f.truncate()
+            elif idx + 1 < len(tail):
+                f.seek(size - block + idx + 1)
+                f.truncate()
+
     # ---- 拒绝日志（对账用） ----
 
     def read_rejections(self) -> list[RejectionEntry]:
@@ -169,10 +217,23 @@ class LocalStorage:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, target)
+            self._fsync_dir(self.data_dir)
         except BaseException:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        """让目录项变更（os.replace 改名）落盘，崩溃后不留歧义。"""
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def read_version_data(self, version: int) -> list[dict]:
         records: list[dict] = []

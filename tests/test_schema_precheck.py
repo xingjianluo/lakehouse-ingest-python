@@ -99,15 +99,79 @@ def test_precheck_reject_then_commit_rejected_same_reason(
     )
 
 
-def test_int_to_float_widening_still_allowed(table_dir):
-    """int -> float 是仅存的加宽：历史 int 值在 float 下语义不变。"""
+@pytest.mark.parametrize(
+    ("stored", "declared", "reason"),
+    [
+        ("int", "float", SchemaRejectionReason.TYPE_MISMATCH),
+        ("float", "int", SchemaRejectionReason.TYPE_NARROWED),
+        ("int", "string", SchemaRejectionReason.TYPE_INCOMPATIBLE),
+        ("string", "int", SchemaRejectionReason.TYPE_INCOMPATIBLE),
+        ("string", "bool", SchemaRejectionReason.TYPE_INCOMPATIBLE),
+        ("bool", "string", SchemaRejectionReason.TYPE_INCOMPATIBLE),
+    ],
+    ids=[
+        "int_to_float",
+        "float_to_int",
+        "int_to_string",
+        "string_to_int",
+        "string_to_bool",
+        "bool_to_string",
+    ],
+)
+def test_any_existing_column_type_change_rejected_with_distinct_reason(
+    table_dir, stored, declared, reason
+):
+    """已存字段的任何类型变更都在写入前拒绝，且原因彼此可区分。"""
+    t = Table(table_dir, Schema((Field("v", stored),)))
+    t.commit_batch("b1", [{"v": None}])
+
+    pre = t.check_schema(Schema((Field("v", declared),)))
+    assert not pre.accepted
+    assert pre.reason == reason
+    assert pre.field == "v"
+    log.info(
+        "预检拒绝: 字段类型 %s->%s 原因=%s 判定依据=%s",
+        stored,
+        declared,
+        pre.reason.value,
+        pre.detail,
+    )
+
+    with pytest.raises(IncompatibleSchemaError) as exc:
+        t.commit_batch("b2", [{"v": None}], Schema((Field("v", declared),)))
+    assert exc.value.reason == reason
+
+    # 拒绝不留数据、不占版本；同批次号再来一次不受失败影响。
+    assert t.current_version() == 1
+    assert not t.storage.version_path(2).exists()
+    v = t.commit_batch("b2", [{"v": None}])  # 不带结构，沿用原结构
+    assert v == 2
+    log.info("拒绝后同号重试: batch=b2 version=%d 判定依据=拒绝记录不参与提交判定", v)
+
+
+def test_int_to_float_rejected_precheck_matches_commit(table_dir):
+    """int -> float 拒绝：历史行读出来仍是 int，与声明 float 对不上；
+    预检与提交给出同一个原因。"""
     t = Table(table_dir, Schema((Field("v", "int"),)))
     t.commit_batch("b1", [{"v": 1}])
     widened = Schema((Field("v", "float"),))
-    assert t.check_schema(widened).accepted
-    t.commit_batch("b2", [{"v": 2.5}], widened)
-    assert t.snapshot() == [{"v": 1}, {"v": 2.5}]
-    log.info("加宽放行: int->float 判定依据=整数是浮点子集, 历史值语义不变")
+    pre = t.check_schema(widened)
+    assert not pre.accepted
+    assert pre.reason == SchemaRejectionReason.TYPE_MISMATCH
+    log.info(
+        "预检拒绝: int->float 原因=%s 字段=%s 判定依据=%s",
+        pre.reason.value,
+        pre.field,
+        pre.detail,
+    )
+    with pytest.raises(IncompatibleSchemaError) as exc:
+        t.commit_batch("b2", [{"v": 2.5}], widened)
+    assert exc.value.reason == pre.reason
+    # 不留任何残留。
+    assert t.current_version() == 1
+    assert not t.storage.version_path(2).exists()
+    assert t.snapshot() == [{"v": 1}]
+    log.info("提交拒绝: batch=b2 原因=%s 与预检一致, 无残留", exc.value.reason.value)
 
 
 def test_float_to_int_narrowing_rejected(table_dir):

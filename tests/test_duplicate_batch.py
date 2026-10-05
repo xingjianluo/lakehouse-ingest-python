@@ -116,6 +116,109 @@ def test_batch_status_committed_rejected_unknown(table_dir):
     log.info("对账[未知]: batch=never-seen status=unknown")
 
 
+def test_retry_without_schema_treated_as_same_attempt(table_dir):
+    """重试时不重复携带结构、内容一致 -> 按重试处理，不冲突、不写入。"""
+    t = Table(table_dir, SCHEMA)
+    v1 = t.commit_batch("retry-no-schema", RECORDS, SCHEMA)
+
+    v2 = t.commit_batch("retry-no-schema", RECORDS)  # 这次不带 schema
+    assert v2 == v1
+    log.info(
+        "不带结构重试: batch=retry-no-schema 返回 version=%d 判定依据=记录内容一致", v2
+    )
+    # 记录内 dict 键顺序不同也不影响（内容完全一样）。
+    v3 = t.commit_batch(
+        "retry-no-schema", [{"name": "a", "id": 1}, {"name": "b", "id": 2}]
+    )
+    assert v3 == v1
+    assert t.current_version() == v1
+    assert len(t.storage.read_log()) == 1
+
+
+def test_retry_with_reordered_schema_fields_treated_as_same_attempt(table_dir):
+    """重试时结构字段书写顺序不同、内容一致 -> 按重试处理。"""
+    t = Table(table_dir, SCHEMA)
+    v1 = t.commit_batch("retry-reorder", RECORDS, SCHEMA)
+    reordered = Schema((Field("name", "string"), Field("id", "int")))
+
+    v2 = t.commit_batch("retry-reorder", RECORDS, reordered)
+    assert v2 == v1
+    log.info(
+        "字段顺序不同的重试: batch=retry-reorder 返回 version=%d 判定依据=结构语义相同",
+        v2,
+    )
+    # 反向组合：首次不带结构，重试带相同结构。
+    v3 = t.commit_batch("retry-reorder-2", RECORDS)
+    v4 = t.commit_batch("retry-reorder-2", RECORDS, reordered)
+    assert v4 == v3
+    assert t.current_version() == 2
+    assert len(t.storage.read_log()) == 2
+
+
+def test_retry_with_different_schema_intent_conflicts(table_dir):
+    """记录一样但声明了不同的结构 -> 内容意图不同，仍然按冲突失败。"""
+    base = Schema((Field("id", "int"),))
+    evolved = Schema((Field("id", "int"), Field("tag", "string", "x")))
+    t = Table(table_dir, base)
+    v1 = t.commit_batch("retry-schema-change", [{"id": 1}], base)
+    # 需要先让 tag 字段存在，再制造"同记录、不同结构意图"。
+    t.commit_batch("evolve", [], evolved)
+    with pytest.raises(BatchConflictError) as exc:
+        t.commit_batch("retry-schema-change", [{"id": 1}], evolved)
+    assert exc.value.committed_version == v1
+    log.info(
+        "结构意图冲突: batch=%s 已提交版本=%d 判定依据=声明结构不同",
+        exc.value.batch_id,
+        exc.value.committed_version,
+    )
+
+
+def test_batch_status_record_count_is_batch_own_count(table_dir):
+    """对账条数 = 该批次自己的条数，不是整张表当前的总条数。"""
+    t = Table(table_dir, SCHEMA)
+    t.commit_batch("first", [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}])
+    t.commit_batch(
+        "second",
+        [
+            {"id": 3, "name": "c"},
+            {"id": 4, "name": "d"},
+            {"id": 5, "name": "e"},
+        ],
+    )
+    st = t.batch_status("second")
+    assert st.status == "committed"
+    assert st.record_count == 3  # 第二批自己的 3 条，而非表总量 5
+    log.info(
+        "对账条数: batch=second 本批条数=%d 表总条数=%d 判定依据=batch_record_count",
+        st.record_count,
+        len(t.snapshot()),
+    )
+    assert t.batch_status("first").record_count == 2
+
+
+def test_conflict_retry_visible_in_reconciliation(table_dir):
+    """冲突失败也要能从对账看到原因与已落地版本。"""
+    t = Table(table_dir, SCHEMA)
+    v1 = t.commit_batch("rc", [{"id": 1, "name": "a"}])
+    with pytest.raises(BatchConflictError) as exc:
+        t.commit_batch("rc", [{"id": 1, "name": "CHANGED"}])
+    assert exc.value.committed_version == v1
+    # 已落地批次的对账结果仍是 committed，但能看到最近一次失败尝试。
+    st = t.batch_status("rc")
+    assert st.status == "committed"
+    assert st.version == v1
+    assert st.last_rejection_reason == "batch_conflict"
+    assert "1" in st.last_rejection_detail
+    log.info(
+        "对账[冲突尝试]: batch=rc version=%d 最近失败原因=%s",
+        st.version,
+        st.last_rejection_reason,
+    )
+    # 冲突失败后用正确内容重试仍然幂等，不受失败尝试影响。
+    assert t.commit_batch("rc", [{"id": 1, "name": "a"}]) == v1
+    assert t.current_version() == 1
+
+
 def test_rejected_batch_retry_is_judged_fresh(table_dir):
     """被拒绝的批次不占版本、不留数据；同号重试按全新提交重新判定。"""
     t = Table(table_dir, SCHEMA)

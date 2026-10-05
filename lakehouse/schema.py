@@ -1,19 +1,23 @@
 """表结构定义与演进兼容性校验。
 
 兼容规则（收敛目标：任何被放行的变更，都必须让已存数据在新结构下
-语义依然成立，即"历史数据的类型/取值 与 声明的结构 永远对得上"）：
+语义依然成立，即"历史数据读出来的类型/取值 与 声明的结构 永远
+对得上"）：
 
 - 新增字段：允许，但字段类型必须已知，且缺省值（非 None 时）必须与
   声明类型匹配；缺省值对历史数据稳定生效，因此历史行在新结构下
   自动成立。default 为 None 表示可空，任何类型都接受 None。
-- 类型加宽：仅允许 int -> float（整数是浮点的真子集，历史 int 值
-  在新结构 float 下语义不变）。
+- 已存在字段的类型一律不允许变更。历史行按写入时的原始类型原样存放，
+  不会被重写：
+  - int -> float：拒绝，TYPE_MISMATCH。历史行读出来仍是 int，与声明的
+    float 对不上，哪怕数值语义相近也不允许（例如 int 列改成 float，
+    历史那几行读出来还是整数，属于两边对不上）。
+  - float -> int：拒绝，TYPE_NARROWED（收窄会丢精度，历史浮点值无法
+    用 int 表示）。
+  - 其余跨类型族变更（int/float -> string、string -> bool 等）：
+    拒绝，TYPE_INCOMPATIBLE。
 - 其余一切变更都会被拒绝，且原因可区分：
-  - 删除字段            -> FIELD_REMOVED
-  - 类型收窄 float->int -> TYPE_NARROWED
-  - 跨类型族变更        -> TYPE_INCOMPATIBLE
-    （int/float -> string、string -> bool 等；历史值类型与新声明
-      对不上，属于破坏既有数据语义）
+  - 删除字段                 -> FIELD_REMOVED
   - 新字段缺省值与类型不匹配 -> DEFAULT_TYPE_MISMATCH
   - 未知类型名               -> UNKNOWN_TYPE
 
@@ -27,10 +31,11 @@ from dataclasses import dataclass
 
 from .errors import IncompatibleSchemaError, SchemaRejectionReason
 
-# 已知类型集合。数值族内部只允许 int -> float 加宽；
-# string / bool 各自独立成族，不与数值族互通。
+# 已知类型集合。已存字段的任何类型变更都会让历史数据与声明对不上，
+# 因此不存在受支持的类型迁移；string / bool / int / float 彼此独立。
 _KNOWN_TYPES = {"int", "float", "string", "bool"}
-_NUMERIC_WIDENING = {("int", "float")}
+# float -> int 属于会丢精度的收窄；int -> float 同样拒绝（历史值仍是 int）。
+_NUMERIC_NARROWING = {("float", "int")}
 
 
 @dataclass(frozen=True)
@@ -112,16 +117,24 @@ def _evaluate(old: Schema, new: Schema) -> SchemaCheckResult:
         new_field = new_map[name]
         if old_field.type == new_field.type:
             continue
-        if (old_field.type, new_field.type) in _NUMERIC_WIDENING:
-            continue  # int -> float：历史 int 值在 float 下语义不变
-        if old_field.type in ("int", "float") and new_field.type in ("int", "float"):
+        if (old_field.type, new_field.type) in _NUMERIC_NARROWING:
             return SchemaCheckResult(
                 accepted=False,
                 reason=SchemaRejectionReason.TYPE_NARROWED,
                 field=name,
                 detail=(
                     f"类型 {old_field.type!r} -> {new_field.type!r} 属于收窄，"
-                    "会破坏既有数据"
+                    "历史浮点值无法用 int 表示，会破坏既有数据"
+                ),
+            )
+        if (old_field.type, new_field.type) == ("int", "float"):
+            return SchemaCheckResult(
+                accepted=False,
+                reason=SchemaRejectionReason.TYPE_MISMATCH,
+                field=name,
+                detail=(
+                    f"类型 {old_field.type!r} -> {new_field.type!r} 后历史行读出来"
+                    "仍是 int，与声明的 float 对不上；已存数据不做重写"
                 ),
             )
         return SchemaCheckResult(
