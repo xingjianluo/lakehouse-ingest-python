@@ -6,11 +6,14 @@
 - 新增字段：允许，但字段类型必须已知，且缺省值（非 None 时）必须与
   声明类型匹配；缺省值对历史数据稳定生效，因此历史行在新结构下
   自动成立。default 为 None 表示可空，任何类型都接受 None。
-- 类型加宽：仅允许 int -> float（整数是浮点的真子集，历史 int 值
-  在新结构 float 下语义不变）。
+- 既有字段的类型一律不允许改变——包括 int -> float 这种"加宽"：
+  历史行里存的是整数，读出来与声明的 float 对不上，属于两边
+  对不上的情况，同样拒绝（原因 TYPE_WIDENED，与收窄、跨类型族
+  变更区分开）。
 - 其余一切变更都会被拒绝，且原因可区分：
   - 删除字段            -> FIELD_REMOVED
   - 类型收窄 float->int -> TYPE_NARROWED
+  - 类型加宽 int->float -> TYPE_WIDENED
   - 跨类型族变更        -> TYPE_INCOMPATIBLE
     （int/float -> string、string -> bool 等；历史值类型与新声明
       对不上，属于破坏既有数据语义）
@@ -27,10 +30,9 @@ from dataclasses import dataclass
 
 from .errors import IncompatibleSchemaError, SchemaRejectionReason
 
-# 已知类型集合。数值族内部只允许 int -> float 加宽；
-# string / bool 各自独立成族，不与数值族互通。
+# 已知类型集合。string / bool / int / float 各自独立，既有字段的
+# 类型一律不可改变（含数值族内部的 int -> float）。
 _KNOWN_TYPES = {"int", "float", "string", "bool"}
-_NUMERIC_WIDENING = {("int", "float")}
 
 
 @dataclass(frozen=True)
@@ -112,9 +114,19 @@ def _evaluate(old: Schema, new: Schema) -> SchemaCheckResult:
         new_field = new_map[name]
         if old_field.type == new_field.type:
             continue
-        if (old_field.type, new_field.type) in _NUMERIC_WIDENING:
-            continue  # int -> float：历史 int 值在 float 下语义不变
         if old_field.type in ("int", "float") and new_field.type in ("int", "float"):
+            if (old_field.type, new_field.type) == ("int", "float"):
+                # int -> float 虽数值上是加宽，但历史行存的是整数，
+                # 读出来与声明的 float 对不上，同样拒绝。
+                return SchemaCheckResult(
+                    accepted=False,
+                    reason=SchemaRejectionReason.TYPE_WIDENED,
+                    field=name,
+                    detail=(
+                        f"类型 {old_field.type!r} -> {new_field.type!r} 会让历史"
+                        "整数行与声明的浮点类型对不上，不允许变更既有字段类型"
+                    ),
+                )
             return SchemaCheckResult(
                 accepted=False,
                 reason=SchemaRejectionReason.TYPE_NARROWED,
@@ -136,7 +148,7 @@ def _evaluate(old: Schema, new: Schema) -> SchemaCheckResult:
 
     merged = []
     for old_field in old.fields:
-        # 既有字段采用演进后的定义（可能已加宽），保持原有顺序。
+        # 既有字段定义不变（类型不可变更），保持原有顺序。
         merged.append(new_map[old_field.name])
     for new_field in new.fields:
         if new_field.name not in old_map:

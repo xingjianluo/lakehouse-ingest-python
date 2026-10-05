@@ -9,10 +9,14 @@
 
 一致性手段：
 - 所有数据文件先写临时文件再 os.replace 原子改名，避免半截文件；
-- 提交日志只允许追加，读取时按行解析，容忍最后一行残缺（视为未提交）；
+- 提交日志只允许追加；追加前先把上一行未写完的半截残留（崩溃时
+  留下的、无换行符结尾的字节）截掉，保证每条新日志都是完整一行，
+  已成功的提交不会因残留而"消失"；读取时按行解析，容忍最后一行
+  残缺（视为未提交）；
 - 提交临界区由 fcntl.flock 排他锁保护：同一台机器上的多个进程/终端
   对同一张表的提交被串行化，且持锁期间重新读取日志，保证版本号唯一、
-  批次判定基于最新已提交状态。
+  批次判定基于最新已提交状态；进程崩溃时 flock 由内核自动释放，
+  不会留下死锁。
 """
 
 from __future__ import annotations
@@ -36,10 +40,13 @@ class CommitEntry:
     version: int
     batch_id: str
     schema: Schema
-    record_count: int
-    # 批次内容指纹（记录+结构的规范哈希），用于识别"同批次号不同内容"。
+    record_count: int  # 该版本全量快照的总记录数
+    # 批次内容指纹（批次记录内容的规范哈希），用于识别"同批次号不同内容"。
     # 旧格式日志行没有该字段，反序列化时缺省为 None。
     fingerprint: str | None = None
+    # 本批次自身的记录条数（对账用）；旧格式日志行没有该字段，缺省为 None，
+    # 查询时回退为 record_count。
+    batch_record_count: int | None = None
 
     def to_json(self) -> str:
         d = asdict(self)
@@ -55,6 +62,7 @@ class CommitEntry:
             schema=schema,
             record_count=d["record_count"],
             fingerprint=d.get("fingerprint"),
+            batch_record_count=d.get("batch_record_count"),
         )
 
 
@@ -109,6 +117,38 @@ class LocalStorage:
 
     # ---- 元数据日志 ----
 
+    @staticmethod
+    def _append_line(path: Path, line: str) -> None:
+        """向日志文件追加一行完整记录。
+
+        追加前先截掉上一行未写完的半截残留（写入方在追加途中崩溃留下
+        的、没有换行符结尾的字节）。否则新行会拼在残留后面成为一行
+        坏数据，读取时解析失败被整体丢弃——表现为"提交返回了版本号，
+        重新打开却读不到，之后每次提交都像被吞了"。
+        调用方必须已持有表级排他锁（commit/reject 路径均满足）。
+        """
+        with open(path, "a+b") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            if end:
+                # 从文件尾部向前找最后一个换行符；其后若有内容即半截行。
+                pos = end
+                cut = 0  # 没有任何换行符时，整个文件都是半截行
+                while pos > 0:
+                    start = max(0, pos - 4096)
+                    f.seek(start)
+                    buf = f.read(pos - start)
+                    idx = buf.rfind(b"\n")
+                    if idx != -1:
+                        cut = start + idx + 1
+                        break
+                    pos = start
+                if cut < end:
+                    f.truncate(cut)
+            f.write(line.encode("utf-8") + b"\n")
+            f.flush()
+            os.fsync(f.fileno())
+
     def read_log(self) -> list[CommitEntry]:
         """读取全部提交日志；容忍最后一行残缺（崩溃残留），视为未提交。"""
         entries: list[CommitEntry] = []
@@ -124,10 +164,7 @@ class LocalStorage:
         return entries
 
     def append_log(self, entry: CommitEntry) -> None:
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(entry.to_json() + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        self._append_line(self.log_path, entry.to_json())
 
     # ---- 拒绝日志（对账用） ----
 
@@ -148,10 +185,8 @@ class LocalStorage:
         return entries
 
     def append_rejection(self, entry: RejectionEntry) -> None:
-        with open(self.rejections_path, "a", encoding="utf-8") as f:
-            f.write(entry.to_json() + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        self.rejections_path.touch(exist_ok=True)
+        self._append_line(self.rejections_path, entry.to_json())
 
     # ---- 版本数据文件 ----
 

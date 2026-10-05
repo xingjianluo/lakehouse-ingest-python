@@ -81,7 +81,7 @@ def commit_batch(req: CommitRequest):
 
 @app.get("/batches/{batch_id}")
 def get_batch_status(batch_id: str):
-    """批次对账：成功落在哪个版本/多少条，或失败原因；未知批次 404。"""
+    """批次对账：成功落在哪个版本/本批多少条，或失败原因；未知批次 404。"""
     status = table.batch_status(batch_id)
     if status.status == "unknown":
         raise HTTPException(

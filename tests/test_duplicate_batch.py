@@ -129,3 +129,77 @@ def test_rejected_batch_retry_is_judged_fresh(table_dir):
     assert v == 1
     assert t.batch_status("retry-me").status == "committed"
     log.info("拒绝后重试: batch=retry-me version=%d 判定依据=拒绝记录不参与提交判定", v)
+
+
+def test_retry_without_schema_returns_first_result(table_dir):
+    """首次提交带了表结构，重试不再重复带 -> 内容一致，按重试处理。"""
+    t = Table(table_dir, SCHEMA)
+    evolved = Schema((*SCHEMA.fields, Field("tag", "string", "untagged")))
+    records = [{"id": 1, "name": "a", "tag": "x"}]
+    v1 = t.commit_batch("batch-020", records, evolved)
+
+    v2 = t.commit_batch("batch-020", records)  # 不再携带表结构
+    assert v2 == v1
+    assert t.current_version() == v1
+    assert len(t.storage.read_log()) == 1, "重试不得产生任何写入"
+    log.info(
+        "无结构重试: batch=batch-020 返回 version=%d 判定依据=记录内容指纹一致", v2
+    )
+
+
+def test_retry_with_reordered_schema_fields_returns_first_result(table_dir):
+    """重试时表结构字段书写顺序不同 -> 内容一致，按重试处理。"""
+    t = Table(table_dir, SCHEMA)
+    records = [{"id": 1, "name": "a"}]
+    v1 = t.commit_batch("batch-021", records, SCHEMA)
+
+    reordered = Schema((Field("name", "string"), Field("id", "int")))
+    v2 = t.commit_batch("batch-021", records, reordered)
+    assert v2 == v1
+    assert t.current_version() == v1
+    assert len(t.storage.read_log()) == 1
+    log.info(
+        "字段乱序重试: batch=batch-021 返回 version=%d 判定依据=字段顺序不影响内容指纹",
+        v2,
+    )
+
+
+def test_batch_status_reports_batch_own_record_count(table_dir):
+    """对账条数 = 本批自己的条数，而不是整张表当前的总条数。"""
+    t = Table(table_dir, SCHEMA)
+    t.commit_batch("batch-030", [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}])
+    v2 = t.commit_batch(
+        "batch-031",
+        [{"id": 3, "name": "c"}, {"id": 4, "name": "d"}, {"id": 5, "name": "e"}],
+    )
+
+    st = t.batch_status("batch-031")
+    assert st.status == "committed"
+    assert st.version == v2
+    assert st.record_count == 3, "第二批 3 条，不能报成全表累计的 5 条"
+    st_first = t.batch_status("batch-030")
+    assert st_first.record_count == 2
+    assert len(t.snapshot()) == 5  # 全表总条数仍是 5
+    log.info(
+        "对账条数: batch=batch-031 本批条数=%d (全表累计=%d) 判定依据=按批次自身计数",
+        st.record_count,
+        len(t.snapshot()),
+    )
+
+
+def test_conflicting_retry_batch_status_still_points_to_committed(table_dir):
+    """冲突重试失败后，对账仍指向首次提交的版本与本批条数。"""
+    t = Table(table_dir, SCHEMA)
+    v1 = t.commit_batch("batch-040", [{"id": 1, "name": "x"}])
+    with pytest.raises(BatchConflictError) as exc:
+        t.commit_batch("batch-040", [{"id": 1, "name": "CHANGED"}])
+    assert exc.value.committed_version == v1
+
+    st = t.batch_status("batch-040")
+    assert st.status == "committed"
+    assert st.version == v1
+    assert st.record_count == 1
+    log.info(
+        "冲突后对账: batch=batch-040 仍落在 version=%d 判定依据=已提交记录优先于拒绝记录",
+        st.version,
+    )

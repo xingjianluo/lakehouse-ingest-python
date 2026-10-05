@@ -29,6 +29,7 @@ class SchemaRejectionReason(str, Enum):
 
     FIELD_REMOVED = "field_removed"
     TYPE_NARROWED = "type_narrowed"
+    TYPE_WIDENED = "type_widened"
     TYPE_INCOMPATIBLE = "type_incompatible"
     DEFAULT_TYPE_MISMATCH = "default_type_mismatch"
     UNKNOWN_TYPE = "unknown_type"

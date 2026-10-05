@@ -49,6 +49,10 @@ def test_precheck_accept_then_commit_succeeds(table_dir):
             SchemaRejectionReason.TYPE_INCOMPATIBLE,  # int->string 不再放行
         ),
         (
+            Schema((Field("id", "float"), Field("name", "string"))),
+            SchemaRejectionReason.TYPE_WIDENED,  # int->float 也不放行
+        ),
+        (
             Schema((*BASE.fields, Field("tag", "int", "oops"))),
             SchemaRejectionReason.DEFAULT_TYPE_MISMATCH,
         ),
@@ -61,6 +65,7 @@ def test_precheck_accept_then_commit_succeeds(table_dir):
         "field_removed",
         "cross_family",
         "int_to_string",
+        "int_to_float",
         "bad_default",
         "unknown_type",
     ],
@@ -99,15 +104,30 @@ def test_precheck_reject_then_commit_rejected_same_reason(
     )
 
 
-def test_int_to_float_widening_still_allowed(table_dir):
-    """int -> float 是仅存的加宽：历史 int 值在 float 下语义不变。"""
+def test_int_to_float_widening_rejected(table_dir):
+    """int -> float 不再放行：历史 int 行读出来与声明的 float 对不上。
+
+    预检结论必须与真实提交一致（都拒绝、原因相同），且拒绝不留残留。
+    """
     t = Table(table_dir, Schema((Field("v", "int"),)))
     t.commit_batch("b1", [{"v": 1}])
     widened = Schema((Field("v", "float"),))
-    assert t.check_schema(widened).accepted
-    t.commit_batch("b2", [{"v": 2.5}], widened)
-    assert t.snapshot() == [{"v": 1}, {"v": 2.5}]
-    log.info("加宽放行: int->float 判定依据=整数是浮点子集, 历史值语义不变")
+
+    pre = t.check_schema(widened)
+    assert not pre.accepted
+    assert pre.reason == SchemaRejectionReason.TYPE_WIDENED
+    assert pre.field == "v"
+    log.info(
+        "预检拒绝: int->float 原因=%s 判定依据=%s", pre.reason.value, pre.detail
+    )
+
+    with pytest.raises(IncompatibleSchemaError) as exc:
+        t.commit_batch("b2", [{"v": 2.5}], widened)
+    assert exc.value.reason == pre.reason  # 预检与提交同一判定逻辑
+    assert t.current_version() == 1
+    assert t.snapshot() == [{"v": 1}]
+    assert not t.storage.version_path(2).exists()
+    log.info("提交拒绝: batch=b2 原因=%s 与预检一致, 无版本/数据残留", exc.value.reason.value)
 
 
 def test_float_to_int_narrowing_rejected(table_dir):

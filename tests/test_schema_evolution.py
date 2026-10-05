@@ -99,13 +99,24 @@ def test_incompatible_type_change_rejected(table_dir):
     assert t.current_version() == 1
 
 
-def test_type_widening_allowed(table_dir):
+def test_type_widening_rejected(table_dir):
+    """int -> float 也拒绝：历史行读出来仍是整数，与声明的 float 对不上。"""
     t = Table(table_dir, Schema((Field("v", "int"),)))
     t.commit_batch("b1", [{"v": 1}])
     widened = Schema((Field("v", "float"),))
-    v2 = t.commit_batch("b2", [{"v": 2.5}], widened)
-    assert t.snapshot() == [{"v": 1}, {"v": 2.5}]
-    log.info("加宽放行: version=%d batch=b2 判定依据=int->float 为兼容加宽", v2)
+    with pytest.raises(IncompatibleSchemaError) as exc:
+        t.commit_batch("b2", [{"v": 2.5}], widened)
+    assert exc.value.reason == SchemaRejectionReason.TYPE_WIDENED
+    assert exc.value.field == "v"
+    log.info(
+        "拒绝: batch=b2 原因=%s 字段=v 判定依据=int->float 历史整数行与声明类型对不上",
+        exc.value.reason.value,
+    )
+    # 被拒绝的提交不留任何残留：版本、数据、结构均不变。
+    assert t.current_version() == 1
+    assert t.snapshot() == [{"v": 1}]
+    assert t.schema() == Schema((Field("v", "int"),))
+    assert not t.storage.version_path(2).exists()
 
 
 def test_record_value_type_mismatch_rejected(table_dir):
@@ -122,3 +133,24 @@ def test_unknown_field_in_record_rejected(table_dir):
         t.commit_batch("b1", [{"id": 1, "name": "a", "ghost": 1}])
     assert t.current_version() == 0
     log.info("拒绝: batch=b1 判定依据=记录包含未知字段 ghost, 不静默丢弃")
+
+
+def test_float_field_int_values_normalized_to_float(table_dir):
+    """float 字段的整数值/整型缺省值在写入时规范化为浮点。
+
+    保证落盘数据的类型与声明结构永远对得上：历史行补出的缺省值、
+    本批写入的整数值，读回来都是浮点。
+    """
+    t = Table(table_dir, Schema((Field("id", "int"),)))
+    t.commit_batch("b1", [{"id": 1}])
+    evolved = Schema((Field("id", "int"), Field("ratio", "float", 1)))
+    t.commit_batch("b2", [{"id": 2, "ratio": 2}], evolved)
+
+    rows = t.snapshot()
+    assert rows[0]["ratio"] == 1.0 and isinstance(rows[0]["ratio"], float)
+    assert rows[1]["ratio"] == 2.0 and isinstance(rows[1]["ratio"], float)
+    log.info(
+        "类型规范化: 历史行缺省值=%r 本批整数值=%r 判定依据=float 字段落盘一律为浮点",
+        rows[0]["ratio"],
+        rows[1]["ratio"],
+    )

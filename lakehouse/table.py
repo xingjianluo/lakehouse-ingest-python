@@ -56,23 +56,20 @@ class BatchStatus:
     batch_id: str
     status: str  # "committed" | "rejected" | "unknown"
     version: int | None = None  # committed 时：落在哪个版本
-    record_count: int | None = None  # committed 时：该版本总记录数
+    record_count: int | None = None  # committed 时：该批次自身的记录条数
     reason: str | None = None  # rejected 时：可程序识别的原因
     detail: str | None = None  # rejected 时：人类可读判定依据
 
 
-def _fingerprint(records: list[dict], schema: Schema | None) -> str:
-    """批次内容指纹：记录与结构的规范哈希，用于识别"同号不同内容"。"""
-    payload = {
-        "records": records,
-        "schema": (
-            [[f.name, f.type, f.default] for f in schema.fields]
-            if schema is not None
-            else None
-        ),
-    }
+def _fingerprint(records: list[dict]) -> str:
+    """批次内容指纹：批次记录内容的规范哈希，用于识别"同号不同内容"。
+
+    只覆盖记录内容本身（键序无关）：同一批数据重试时无论是否重复携带
+    表结构、结构字段书写顺序如何，指纹都一致，按幂等重试处理；只有
+    记录内容真的变了才判定为冲突。
+    """
     canonical = json.dumps(
-        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=repr
+        records, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=repr
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -113,7 +110,7 @@ class Table:
         # 排他锁串行化多进程提交；持锁后刷新日志，基于最新已提交状态判定。
         with self._lock, self.storage.locked(exclusive=True):
             self._refresh()
-            fp = _fingerprint(records, schema)
+            fp = _fingerprint(records)
 
             for e in self._entries:
                 if e.batch_id == batch_id:
@@ -151,7 +148,12 @@ class Table:
             # 未提交，重试整体重写该版本，不会多也不会少。
             self.storage.write_version_data(version, snapshot_rows)
             entry = CommitEntry(
-                version, batch_id, target_schema, len(snapshot_rows), fp
+                version,
+                batch_id,
+                target_schema,
+                len(snapshot_rows),
+                fp,
+                batch_record_count=len(records),
             )
             self.storage.append_log(entry)
             self._entries.append(entry)
@@ -181,7 +183,12 @@ class Table:
                         batch_id=batch_id,
                         status="committed",
                         version=e.version,
-                        record_count=e.record_count,
+                        # 本批自身的条数；旧格式日志无该字段时回退为版本总条数。
+                        record_count=(
+                            e.batch_record_count
+                            if e.batch_record_count is not None
+                            else e.record_count
+                        ),
                     )
             rejections = [
                 r for r in self.storage.read_rejections() if r.batch_id == batch_id
@@ -276,15 +283,29 @@ class Table:
         )
 
     @staticmethod
-    def _apply_defaults(record: dict, schema: Schema) -> dict:
+    def _coerce_value(field: Field, value: object) -> object:
+        """把写入值规范化为声明类型：float 字段的整数值统一转为浮点，
+        保证落盘数据的类型与声明结构永远对得上（整数是浮点的子集，
+        转换无损）。"""
+        if (
+            field.type == "float"
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+        ):
+            return float(value)
+        return value
+
+    @classmethod
+    def _apply_defaults(cls, record: dict, schema: Schema) -> dict:
         """为记录补齐结构中缺失字段的缺省值（对历史数据稳定生效）。"""
         out = dict(record)
         for f in schema.fields:
-            out.setdefault(f.name, f.default)
+            if f.name not in out:
+                out[f.name] = cls._coerce_value(f, f.default)
         return out
 
-    @staticmethod
-    def _normalize_record(record: dict, schema: Schema) -> dict:
+    @classmethod
+    def _normalize_record(cls, record: dict, schema: Schema) -> dict:
         fields: dict[str, Field] = schema.field_map()
         unknown = set(record) - set(fields)
         if unknown:
@@ -297,6 +318,8 @@ class Table:
                     raise RecordValidationError(
                         f"字段 {name!r} 期望类型 {f.type!r}，实际值 {v!r}"
                     )
+                if v is not None:
+                    out[name] = cls._coerce_value(f, v)
             else:
-                out[name] = f.default
+                out[name] = cls._coerce_value(f, f.default)
         return out
